@@ -1,0 +1,96 @@
+#!/bin/bash
+
+# -------------------------------------------------------------------------- #
+# Copyright 2002-2012, OpenNebula Project Leads (OpenNebula.org)             #
+#                                                                            #
+# Licensed under the Apache License, Version 2.0 (the "License"); you may    #
+# not use this file except in compliance with the License. You may obtain    #
+# a copy of the License at                                                   #
+#                                                                            #
+# http://www.apache.org/licenses/LICENSE-2.0                                 #
+#                                                                            #
+# Unless required by applicable law or agreed to in writing, software        #
+# distributed under the License is distributed on an "AS IS" BASIS,          #
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   #
+# See the License for the specific language governing permissions and        #
+# limitations under the License.                                             #
+#--------------------------------------------------------------------------- #
+
+###############################################################################
+# This script is used to copy a VM image (SRC) to the image repository as DST
+# Several SRC types are supported
+###############################################################################
+# -------- Set up the environment to source common tools & conf ------------
+
+# NOTE
+# Inria uses a custom setup which uses both lvm and NFS
+# a NFS share is mounted on frontend (rw) and all workers (ro mode)
+# When an image need to be deployed on node, it is copied from the NFS to the local drives
+# so that there is no write on NFS from nodes (and so no congestion)
+# When an image is saved, it is backuped up from node to frontend *by ssh* and then
+# wrote it on nfs, it is not really optimal but avoid giving rw mode on nodes
+###
+
+set -x
+
+SRC=$1
+DST=$2
+VM_ID=$3
+DS_ID=$4
+
+
+if [ -z "${ONE_LOCATION}" ]; then
+    TMCOMMON=/var/lib/one/remotes/tm/tm_common.sh
+else
+    TMCOMMON=$ONE_LOCATION/var/remotes/tm/tm_common.sh
+fi
+
+DRIVER_PATH=$(dirname $0)
+
+source $TMCOMMON
+source ${DRIVER_PATH}/../../datastore/lvm/lvm.conf
+
+#-------------------------------------------------------------------------------
+# Set dst path and dir
+#-------------------------------------------------------------------------------
+
+SRC_HOST=`arg_host $SRC`
+SRC_PATH=`arg_path $SRC`
+
+DST_PATH=`arg_path $DST`
+DST_HOST=`arg_host $DST`
+DST_DIR=`dirname $DST_PATH`
+
+DISK_ID=$(echo $DST_PATH|awk -F. '{print $NF}')
+SIZE=$((`ls -lk $(readlink -f $SRC_PATH) |awk '{ print $5 }'`))
+
+#-------------------------------------------------------------------------------
+# Get other LVM related fields
+#-------------------------------------------------------------------------------
+
+SRC_LV_NAME=`echo $SRC_PATH |  awk -F'/' '{ print $NF }'`
+LV_NAME=lv-one-$VM_ID-$DISK_ID
+
+
+function return_with_error {
+    log "Some steps failed. Please check log above"
+    log "Remove source lv if exists because it can be incoherent"
+    exec_and_log "$SSH $DST_HOST $SUDO $LVS | $GREP -qs $SRC_LV_NAME && $LVREMOVE $SRC_LV_NAME"                                         #delete_src_lv
+    exit 127                                                                                                                            #leave_with_error
+}
+
+SNAP_SIZE=$((SIZE * 11 / 10)) #bc does not support float, so *11 / 10 is to add 10%
+SRC_LV_NAME=`echo $SRC_PATH |  awk -F'/' '{ print $NF }'`
+DEV="/dev/$VG_NAME/$LV_NAME"
+
+log "copy $SRC_LV_NAME on $DST_HOST"                                                                           
+# The pvs |grep stuff allows stripping across PVs, should be updated to only allow stripping on PVs used by the VG
+ssh_exec_and_log "$DST_HOST" "$SUDO $LVCREATE -i \$($SUDO pvs --noheadings |grep $VG_NAME | wc -l) -L${SIZE}k -n $LV_NAME $VG_NAME" "Error creating source image $SRC_LV_NAME"
+ssh_exec_and_log "$DST_HOST" "eval cat $SRC_PATH | $SUDO $DD of=/dev/$VG_NAME/$LV_NAME bs=1M" || return_with_error     
+
+exec_and_log "$SUDO $MKDIR -p $(dirname $DST_PATH)"
+exec_and_log "$SUDO $CHOWN oneadmin $(dirname $DST_PATH)"
+exec_and_log "ln -s /dev/$VG_NAME/$LV_NAME $DST_PATH"
+trap - INT TERM EXIT
+
+echo "$LVM_SOURCE"
